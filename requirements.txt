@@ -34,6 +34,8 @@ openpyxl
 ### Pydantic AI (Updated to resolve conflicts)
 pydantic-ai==1.2.1
 asgiref
+opentelemetry-api==1.38.0
+opentelemetry-sdk==1.38.0
 
 # Web Server
 gunicorn

@@ -1,23 +1,31 @@
 import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass, field
 from copy import deepcopy
 from typing import Any, AsyncGenerator, Optional
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks
+import httpx
 from langfuse import get_client, observe, propagate_attributes
 from pydantic_ai import AgentRunResultEvent, FinalResultEvent, PartDeltaEvent, TextPartDelta
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.usage import RequestUsage
 
 from agents.agrinet import agrinet_agent
 from agents.deps import FarmerContext
+from agents.tools.maps import forward_geocode
+from agents.tools.weather import weather_forecast
 from agents.models import (
     LANGFUSE_MODERATION_MODEL_NAME,
+    LLM_PROVIDER,
     AgrinetRoute,
     get_agrinet_route_model,
     get_agrinet_route_model_name,
 )
-from agents.moderation import moderation_agent
+from agents.moderation import QueryModerationResult, moderation_agent
 from app.config import settings
 from app.services.agrinet_routing import (
     AgrinetRouteDecision,
@@ -47,7 +55,7 @@ from helpers.telemetry import (
     create_chat_question_event,
     create_frontend_compatible_item_batch,
 )
-from helpers.utils import get_logger
+from helpers.utils import get_crop_season, get_logger, get_prompt, get_today_date_str
 
 logger = get_logger(__name__)
 
@@ -65,11 +73,178 @@ class _AgrinetCompletedRun:
     output_text: str
 
 
+class _BedrockRunResult:
+    """Small adapter that mimics the pydantic-ai run result API we consume."""
+
+    def __init__(self, output_text: str, messages: list, usage: RequestUsage):
+        self.output = output_text
+        self._messages = messages
+        self._usage = usage
+
+    def new_messages(self):
+        return self._messages
+
+    def usage(self):
+        return self._usage
+
+
 @dataclass
 class _AgrinetStreamState:
     final_result_found: bool = False
     inside_think_block: bool = False
     raw_chunks: list[str] = field(default_factory=list)
+
+
+def _is_bedrock_mode() -> bool:
+    return (LLM_PROVIDER or "").strip().lower() == "bedrock"
+
+
+def _bedrock_auth_header_value(token: str) -> str:
+    auth_scheme = os.getenv("BEDROCK_AUTH_SCHEME")
+    auth_scheme = "Bearer" if auth_scheme is None else auth_scheme.strip()
+    if auth_scheme.lower() == "none":
+        auth_scheme = ""
+    return f"{auth_scheme} {token}" if auth_scheme else token
+
+
+def _get_bedrock_request_headers() -> dict[str, str]:
+    token = (os.getenv("BEDROCK_API_KEY") or os.getenv("BEDROCK_TOKEN") or "").strip()
+    if not token:
+        raise ValueError("BEDROCK_API_KEY or BEDROCK_TOKEN environment variable is required")
+
+    auth_header = (os.getenv("BEDROCK_AUTH_HEADER") or "Authorization").strip()
+    return {
+        "Content-Type": "application/json",
+        auth_header: _bedrock_auth_header_value(token),
+    }
+
+
+def _get_bedrock_base_url() -> str:
+    base_url = (os.getenv("BEDROCK_BASE_URL") or "").strip().rstrip("/")
+    if not base_url:
+        raise ValueError("BEDROCK_BASE_URL environment variable is required")
+    return base_url
+
+
+def _extract_bedrock_text(response_payload: dict[str, Any]) -> str:
+    content = ((response_payload.get("output") or {}).get("message") or {}).get("content") or []
+    texts: list[str] = []
+    for item in content:
+        if isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    return "".join(texts).strip()
+
+
+def _extract_bedrock_usage(response_payload: dict[str, Any]) -> RequestUsage:
+    usage = response_payload.get("usage") or {}
+    return RequestUsage(
+        input_tokens=int(usage.get("inputTokens") or 0),
+        output_tokens=int(usage.get("outputTokens") or 0),
+    )
+
+
+async def _call_bedrock_converse(
+    *,
+    model_name: str,
+    user_message: str,
+    system_prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout_seconds: float,
+) -> tuple[str, RequestUsage]:
+    url = f"{_get_bedrock_base_url()}/model/{quote(model_name, safe='')}/converse"
+    payload = {
+        "system": [{"text": system_prompt}] if system_prompt else [],
+        "messages": [{"role": "user", "content": [{"text": user_message}]}],
+        "inferenceConfig": {
+            "maxTokens": max_tokens,
+            "temperature": temperature,
+            "topP": top_p,
+        },
+    }
+
+    timeout = httpx.Timeout(timeout_seconds, read=timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, headers=_get_bedrock_request_headers(), json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    output_text = _extract_bedrock_text(data)
+    if not output_text:
+        raise ValueError("Bedrock response did not contain output.message.content[].text")
+    return output_text, _extract_bedrock_usage(data)
+
+
+def _normalize_moderation_category(category: str | None) -> str:
+    allowed = {
+        "valid_agricultural",
+        "invalid_non_agricultural",
+        "invalid_external_reference",
+        "invalid_compound_mixed",
+        "invalid_language",
+        "unsafe_illegal",
+        "political_controversial",
+        "role_obfuscation",
+    }
+    if not category:
+        return "valid_agricultural"
+
+    normalized = category.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized if normalized in allowed else "valid_agricultural"
+
+
+def _parse_moderation_json(text: str) -> QueryModerationResult:
+    # Extract the first JSON object if the model wrapped it in prose.
+    match = re.search(r"\{[\s\S]*\}", text)
+    payload_text = match.group(0) if match else text
+    payload = json.loads(payload_text)
+
+    category = _normalize_moderation_category(str(payload.get("category", "")))
+    action = str(payload.get("action") or "Proceed with agricultural assistance.").strip()
+    return QueryModerationResult(category=category, action=action)
+
+
+async def _run_bedrock_moderation(user_message: str) -> QueryModerationResult:
+    prompt = get_prompt("moderation_system")
+    schema_instruction = (
+        "Return ONLY valid JSON with keys category and action. "
+        "Allowed category values: valid_agricultural, invalid_non_agricultural, "
+        "invalid_external_reference, invalid_compound_mixed, invalid_language, "
+        "unsafe_illegal, political_controversial, role_obfuscation."
+    )
+
+    output_text, _ = await _call_bedrock_converse(
+        model_name=LANGFUSE_MODERATION_MODEL_NAME,
+        user_message=user_message,
+        system_prompt=f"{prompt}\n\n{schema_instruction}",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=512,
+        timeout_seconds=float(os.getenv("LLM_MODERATION_TIMEOUT_SECONDS", "20")),
+    )
+
+    try:
+        return _parse_moderation_json(output_text)
+    except Exception:
+        logger.warning("Bedrock moderation output was not valid JSON; falling back to safe default")
+        return QueryModerationResult(
+            category="valid_agricultural",
+            action="Proceed with agricultural assistance.",
+        )
+
+
+def _build_agrinet_system_prompt(deps: FarmerContext) -> str:
+    lang_code = deps.lang_code if deps.lang_code else "en"
+    return get_prompt(
+        f"agrinet_{lang_code}",
+        context={
+            "today_date": get_today_date_str(),
+            "crop_season": get_crop_season(),
+        },
+    )
 
 
 def _agrinet_route_metadata(
@@ -116,6 +291,108 @@ def _sanitize_streamed_output(raw_output: str) -> str:
     cleaned_output = re.sub(r"<think>[\s\S]*?</think>", "", raw_output)
     cleaned_output = re.sub(r"<think>[\s\S]*$", "", cleaned_output)
     return cleaned_output.strip()
+
+
+def _looks_like_weather_query(query: str) -> bool:
+    text = (query or "").strip().lower()
+    if not text:
+        return False
+    keywords = ("weather", "forecast", "temperature", "rain", "humidity", "wind")
+    return any(keyword in text for keyword in keywords)
+
+
+def _extract_lat_lon_from_text(text: str) -> tuple[float, float] | None:
+    if not text:
+        return None
+
+    named_match = re.search(
+        r"latitude\s*[:=]?\s*(-?\d+(?:\.\d+)?)\D+longitude\s*[:=]?\s*(-?\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if named_match:
+        return float(named_match.group(1)), float(named_match.group(2))
+
+    bare_match = re.search(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", text)
+    if not bare_match:
+        return None
+
+    lat = float(bare_match.group(1))
+    lon = float(bare_match.group(2))
+    if -90 <= lat <= 90 and -180 <= lon <= 180:
+        return lat, lon
+    return None
+
+
+def _extract_location_from_weather_query(query: str) -> str | None:
+    text = (query or "").strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"(?:weather|forecast)\s+(?:at|in|for)\s+([A-Za-z\s,.-]{2,})",
+        r"(?:at|in|for)\s+([A-Za-z\s,.-]{2,})\s+(?:weather|forecast)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        location = re.sub(r"\s+", " ", match.group(1)).strip(" .?,-")
+        location = re.sub(
+            r"\b(today|tomorrow|tonight|now|currently|right now|this week|next week)\b$",
+            "",
+            location,
+            flags=re.IGNORECASE,
+        ).strip(" .?,-")
+        return location or None
+
+    return None
+
+
+def _fallback_coordinates_for_location(location: str | None) -> tuple[float, float] | None:
+    if not location:
+        return None
+
+    normalized = re.sub(r"\s+", " ", location.strip().lower())
+    city_coords: dict[str, tuple[float, float]] = {
+        "delhi": (28.6139, 77.2090),
+        "new delhi": (28.6139, 77.2090),
+        "mumbai": (19.0760, 72.8777),
+        "pune": (18.5204, 73.8567),
+        "bengaluru": (12.9716, 77.5946),
+        "bangalore": (12.9716, 77.5946),
+        "hyderabad": (17.3850, 78.4867),
+        "chennai": (13.0827, 80.2707),
+        "kolkata": (22.5726, 88.3639),
+    }
+    return city_coords.get(normalized)
+
+
+async def _try_weather_tool_response(raw_query: str) -> str | None:
+    if not _looks_like_weather_query(raw_query):
+        return None
+
+    coords = _extract_lat_lon_from_text(raw_query)
+    geocode_result: str | None = None
+    location: str | None = None
+    if coords is None:
+        location = _extract_location_from_weather_query(raw_query)
+        if location:
+            geocode_result = await forward_geocode(location)
+            coords = _extract_lat_lon_from_text(geocode_result)
+            if coords is None:
+                coords = _fallback_coordinates_for_location(location)
+
+    if coords is None and geocode_result:
+        # Keep weather responses tool-driven: return location/tool error instead of model hallucination.
+        return geocode_result
+
+    if coords is None:
+        return None
+
+    lat, lon = coords
+    logger.info("Weather query routed through tool path with coordinates: %s, %s", lat, lon)
+    return await weather_forecast(latitude=lat, longitude=lon)
 
 
 async def _record_chat_turn(
@@ -338,6 +615,15 @@ async def _run_moderation(user_message: str, session_id: str):
         metadata={"session_id": session_id},
     )
 
+    if _is_bedrock_mode():
+        run_output = await _run_bedrock_moderation(user_message)
+        lf_update_current_observation(
+            output=str(run_output),
+            model=LANGFUSE_MODERATION_MODEL_NAME,
+            metadata={"session_id": session_id, "provider": "bedrock"},
+        )
+        return run_output
+
     run = await moderation_agent.run(user_message)
 
     usage_data = run.usage()
@@ -510,6 +796,67 @@ async def _run_agrinet_once_streaming(
         metadata=observation_metadata,
     )
 
+    if _is_bedrock_mode():
+        weather_output = await _try_weather_tool_response(deps.query)
+        if weather_output:
+            usage = RequestUsage(input_tokens=0, output_tokens=0)
+            if chunk_queue is not None:
+                await chunk_queue.put(weather_output)
+            synthetic_messages = [
+                ModelRequest(parts=[UserPromptPart(content=user_message)]),
+                ModelResponse(
+                    parts=[TextPart(content=weather_output)],
+                    usage=usage,
+                    model_name=decision.model_name,
+                ),
+            ]
+            synthetic_result = _BedrockRunResult(
+                output_text=weather_output,
+                messages=synthetic_messages,
+                usage=usage,
+            )
+
+            lf_update_current_observation(
+                output=weather_output,
+                model=decision.model_name,
+                input_tokens=0,
+                output_tokens=0,
+                metadata={**observation_metadata, "provider": "bedrock", "weather_tool_forced": True},
+            )
+            return _AgrinetCompletedRun(result=synthetic_result, output_text=weather_output)
+
+        output_text, usage = await _call_bedrock_converse(
+            model_name=decision.model_name,
+            user_message=user_message,
+            system_prompt=_build_agrinet_system_prompt(deps),
+            temperature=0.7,
+            top_p=0.95,
+            max_tokens=4096,
+            timeout_seconds=settings.agrinet_model_timeout_seconds,
+        )
+
+        if chunk_queue is not None:
+            await chunk_queue.put(output_text)
+
+        synthetic_messages = [
+            ModelRequest(parts=[UserPromptPart(content=user_message)]),
+            ModelResponse(
+                parts=[TextPart(content=output_text)],
+                usage=usage,
+                model_name=decision.model_name,
+            ),
+        ]
+        synthetic_result = _BedrockRunResult(output_text=output_text, messages=synthetic_messages, usage=usage)
+
+        lf_update_current_observation(
+            output=output_text,
+            model=decision.model_name,
+            input_tokens=usage.input_tokens or 0,
+            output_tokens=usage.output_tokens or 0,
+            metadata={**observation_metadata, "provider": "bedrock"},
+        )
+        return _AgrinetCompletedRun(result=synthetic_result, output_text=output_text)
+
     stream_state = _AgrinetStreamState()
     result = None
 
@@ -609,6 +956,59 @@ async def _run_agrinet_once(
         model=decision.model_name,
         metadata=observation_metadata,
     )
+
+    if _is_bedrock_mode():
+        weather_output = await _try_weather_tool_response(deps.query)
+        if weather_output:
+            usage = RequestUsage(input_tokens=0, output_tokens=0)
+            synthetic_messages = [
+                ModelRequest(parts=[UserPromptPart(content=user_message)]),
+                ModelResponse(
+                    parts=[TextPart(content=weather_output)],
+                    usage=usage,
+                    model_name=decision.model_name,
+                ),
+            ]
+            synthetic_result = _BedrockRunResult(
+                output_text=weather_output,
+                messages=synthetic_messages,
+                usage=usage,
+            )
+            lf_update_current_observation(
+                output=weather_output,
+                model=decision.model_name,
+                input_tokens=0,
+                output_tokens=0,
+                metadata={**observation_metadata, "provider": "bedrock", "weather_tool_forced": True},
+            )
+            return synthetic_result
+
+        output_text, usage = await _call_bedrock_converse(
+            model_name=decision.model_name,
+            user_message=user_message,
+            system_prompt=_build_agrinet_system_prompt(deps),
+            temperature=0.7,
+            top_p=0.95,
+            max_tokens=4096,
+            timeout_seconds=settings.agrinet_model_timeout_seconds,
+        )
+        synthetic_messages = [
+            ModelRequest(parts=[UserPromptPart(content=user_message)]),
+            ModelResponse(
+                parts=[TextPart(content=output_text)],
+                usage=usage,
+                model_name=decision.model_name,
+            ),
+        ]
+        synthetic_result = _BedrockRunResult(output_text=output_text, messages=synthetic_messages, usage=usage)
+        lf_update_current_observation(
+            output=output_text,
+            model=decision.model_name,
+            input_tokens=usage.input_tokens or 0,
+            output_tokens=usage.output_tokens or 0,
+            metadata={**observation_metadata, "provider": "bedrock"},
+        )
+        return synthetic_result
 
     try:
         result = await asyncio.wait_for(

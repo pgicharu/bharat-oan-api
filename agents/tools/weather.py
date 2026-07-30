@@ -1,12 +1,14 @@
 """
 Weather tool for fetching weather forecast data using the IMD API.
 """
+import asyncio
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from helpers.utils import get_logger, get_today_date_str
 import httpx
 from app.config import DEFAULT_HTTP_TIMEOUT
+from app.utils import get_cache
 from pydantic import BaseModel, AnyHttpUrl, Field
 from typing import List, Optional, Dict, Any, Tuple
 from dateutil import parser
@@ -127,7 +129,7 @@ class Tag(BaseModel):
 # Stop & Fulfillment
 # -----------------------
 class Stop(BaseModel):
-    location: Location
+    location: Optional[Location] = None
 
 class Fulfillment(BaseModel):
     id: Optional[str] = None
@@ -138,6 +140,8 @@ class Fulfillment(BaseModel):
         if self.stops:
             lines.append("  Stops:")
             for stop in self.stops:
+                if not stop.location:
+                    continue
                 if stop.location.gps:
                     lines.append(f"    - GPS: {stop.location.gps}")
                 elif stop.location.lat and stop.location.lon:
@@ -310,23 +314,23 @@ class WeatherRequest(BaseModel):
         
         return {
             "context": {
-                "domain": "schemes:vistaar",
+                "domain": "weather-advisory:oan",
                 "action": "search",
                 "version": "1.1.0",
                 "bap_id": os.getenv("BAP_ID"),
                 "bap_uri": os.getenv("BAP_URI"),
-                "bpp_id": os.getenv("BPP_ID"),
-                "bpp_uri": os.getenv("BPP_URI"),
+                # "bpp_id": os.getenv("BPP_ID"),
+                # "bpp_uri": os.getenv("BPP_URI"),
                 "transaction_id": str(uuid.uuid4()),
                 "message_id": str(uuid.uuid4()),
-                "timestamp": str(int(now.timestamp())),
+                "timestamp": now.isoformat(),
                 "ttl": "PT10M",
                 "location": {
                     "country": {
                         "code": "IND"
                     },
                     "city": {
-                        "code": "*"
+                        "code": "std:080"
                     }
                 }
             },
@@ -342,8 +346,7 @@ class WeatherRequest(BaseModel):
                         "stops": [
                             {
                                 "location": {
-                                    "lat": self.latitude,
-                                    "lon": self.longitude
+                                    "gps": f"{self.latitude},{self.longitude}"
                                 }
                             }
                         ]
@@ -351,6 +354,115 @@ class WeatherRequest(BaseModel):
                 }
             }
         }
+
+
+def _normalize_weather_result(data: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
+    """Normalize Beckn weather responses.
+
+    Returns:
+        Tuple[normalized_data, nack_message, is_ack_pending]
+    """
+    if isinstance(data, dict) and "message" in data:
+        ack_status = (
+            data.get("message", {})
+            .get("ack", {})
+            .get("status")
+        )
+        if ack_status == "NACK":
+            err = data.get("message", {}).get("error", {})
+            err_msg = err.get("message") or "Weather service unavailable. Please try again later."
+            return None, str(err_msg), False
+        if ack_status == "ACK" and "responses" not in data:
+            return None, None, True
+
+    # Adapter may return a single on_search object instead of a responses[] envelope.
+    if isinstance(data, dict) and "responses" not in data and "context" in data and "message" in data:
+        data = {
+            "context": data["context"],
+            "responses": [
+                {
+                    "context": data["context"],
+                    "message": data["message"],
+                }
+            ],
+        }
+    return data, None, False
+
+
+def _build_poll_payload(base_payload: Dict[str, Any]) -> Dict[str, Any]:
+    context = dict(base_payload.get("context", {}))
+    context["message_id"] = str(uuid.uuid4())
+    context["timestamp"] = datetime.now(timezone.utc).isoformat()
+    return {
+        "context": context,
+        "message": base_payload.get("message", {}),
+    }
+
+
+async def _poll_weather_async_result(search_url: str, base_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    retry_count = max(int(os.getenv("WEATHER_ASYNC_RETRY_COUNT", "3")), 0)
+    retry_delay_seconds = max(float(os.getenv("WEATHER_ASYNC_RETRY_DELAY_SECONDS", "2")), 0)
+
+    for attempt in range(1, retry_count + 1):
+        await asyncio.sleep(retry_delay_seconds)
+        poll_payload = _build_poll_payload(base_payload)
+        try:
+            response = httpx.post(
+                search_url,
+                json=poll_payload,
+                timeout=DEFAULT_HTTP_TIMEOUT,
+            )
+        except httpx.RequestError as err:
+            logger.warning("Weather async poll attempt %s failed: %s", attempt, err)
+            continue
+
+        if not response.is_success:
+            logger.warning(
+                "Weather async poll attempt %s returned status %s",
+                attempt,
+                response.status_code,
+            )
+            continue
+
+        try:
+            poll_data = response.json()
+        except ValueError:
+            logger.warning("Weather async poll attempt %s returned non-JSON response", attempt)
+            continue
+
+        normalized_data, nack_msg, ack_pending = _normalize_weather_result(poll_data)
+        if nack_msg:
+            logger.warning("Weather async poll returned NACK: %s", nack_msg)
+            return None
+        if normalized_data is not None and not ack_pending:
+            return normalized_data
+
+    return None
+
+
+async def _poll_weather_callback_cache(transaction_id: str | None) -> Optional[Dict[str, Any]]:
+    if not transaction_id:
+        return None
+
+    retry_count = max(int(os.getenv("WEATHER_CALLBACK_RETRY_COUNT", "12")), 0)
+    retry_delay_seconds = max(float(os.getenv("WEATHER_CALLBACK_RETRY_DELAY_SECONDS", "1")), 0)
+    cache_key = f"beckn:on_search:txn:{transaction_id}"
+
+    for attempt in range(1, retry_count + 1):
+        callback_payload = await get_cache(cache_key)
+        if not callback_payload:
+            if attempt < retry_count:
+                await asyncio.sleep(retry_delay_seconds)
+            continue
+
+        normalized_data, nack_msg, ack_pending = _normalize_weather_result(callback_payload)
+        if nack_msg:
+            logger.warning("Weather callback cache returned NACK: %s", nack_msg)
+            return None
+        if normalized_data is not None and not ack_pending:
+            return normalized_data
+
+    return None
 
 
 
@@ -381,7 +493,7 @@ async def weather_forecast(latitude: float, longitude: float) -> str:
             json=payload,
             timeout=DEFAULT_HTTP_TIMEOUT
         )
-        if response.status_code != 200:
+        if not response.is_success:
             logger.error(
                 "Weather API returned status %s for URL %s — response: %s",
                 response.status_code,
@@ -391,6 +503,30 @@ async def weather_forecast(latitude: float, longitude: float) -> str:
             return "Weather service unavailable. Please try again later."
         logger.info("Weather API response OK")
         data = response.json()
+        normalized_data, nack_msg, ack_pending = _normalize_weather_result(data)
+        if nack_msg:
+            return nack_msg
+
+        if ack_pending:
+            transaction_id = payload.get("context", {}).get("transaction_id")
+
+            # First try the callback payload cache written by /api/bap-webhook/on_search.
+            normalized_data = await _poll_weather_callback_cache(transaction_id)
+
+            # Short polling helps when the network returns ACK immediately but bundles
+            # on_search payloads within subsequent /search reads.
+            if normalized_data is None:
+                normalized_data = await _poll_weather_async_result(search_url, payload)
+            if normalized_data is None:
+                return (
+                    "Weather request accepted by the network. "
+                    "Forecast details will arrive asynchronously via on_search."
+                )
+
+        if normalized_data is None:
+            return "Weather service returned an unexpected response format."
+
+        data = normalized_data
         weather_response = WeatherResponse.model_validate(data)
         return str(weather_response)
                 

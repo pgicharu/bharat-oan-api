@@ -20,7 +20,7 @@ for _name in ("helpers.transcription", "helpers.tts", "app.tasks.telemetry", "ap
 logger = logging.getLogger(__name__)
 
 # Import all routers
-from app.routers import chat, transcribe, tts, health, file, token, telemetry
+from app.routers import chat, transcribe, tts, health, file, token, telemetry, bap_webhook
 # from app.routers import suggestions  # Commented out: suggestion agent disabled
 
 class TimingAllowOriginMiddleware(BaseHTTPMiddleware):
@@ -91,3 +91,4 @@ app.include_router(health.router, prefix=settings.api_prefix)
 app.include_router(file.router, prefix=settings.api_prefix)
 app.include_router(token.router, prefix=settings.api_prefix)
 app.include_router(telemetry.router, prefix=settings.api_prefix)
+app.include_router(bap_webhook.router, prefix=settings.api_prefix)

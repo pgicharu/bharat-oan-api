@@ -412,6 +412,16 @@ class MandiRequest(BaseModel):
                         }
                     },
                     "fulfillment": {
+                        "stops": [
+                            {
+                                "location": {
+                                    "descriptor": {
+                                        "name": self.location_name
+                                    },
+                                    "gps": f"{self.latitude},{self.longitude}"
+                                }
+                            }
+                        ],
                         "end": {
                             "location": {
                                 "descriptor": {

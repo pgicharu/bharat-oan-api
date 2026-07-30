@@ -3,6 +3,7 @@ from functools import lru_cache
 from typing import Literal
 
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from openai import AsyncAzureOpenAI
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -32,6 +33,31 @@ def _get_default_azure_client() -> AsyncAzureOpenAI:
         azure_endpoint=azure_endpoint.rstrip("/"),
         api_version=azure_api_version,
         api_key=azure_api_key,
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_default_bedrock_client() -> AsyncOpenAI:
+    base_url = (os.getenv("BEDROCK_BASE_URL") or "").strip()
+    api_key = (os.getenv("BEDROCK_API_KEY") or os.getenv("BEDROCK_TOKEN") or "").strip()
+    auth_header = (os.getenv("BEDROCK_AUTH_HEADER") or "Authorization").strip()
+    auth_scheme = os.getenv("BEDROCK_AUTH_SCHEME")
+    auth_scheme = "Bearer" if auth_scheme is None else auth_scheme.strip()
+
+    if not base_url:
+        raise ValueError("BEDROCK_BASE_URL environment variable is required")
+    if not api_key:
+        raise ValueError("BEDROCK_API_KEY or BEDROCK_TOKEN environment variable is required")
+
+    if auth_scheme.lower() == "none":
+        auth_scheme = ""
+
+    header_value = f"{auth_scheme} {api_key}" if auth_scheme else api_key
+
+    return AsyncOpenAI(
+        base_url=base_url.rstrip("/"),
+        api_key=api_key,
+        default_headers={auth_header: header_value},
     )
 
 
@@ -95,9 +121,28 @@ elif LLM_PROVIDER == "azure-openai":
             openai_client=azure_client,
         ),
     )
+elif LLM_PROVIDER == "bedrock":
+    bedrock_model_name = os.getenv("LLM_AGRINET_MODEL_NAME") or os.getenv("BEDROCK_MODEL_NAME")
+    moderation_model_name = os.getenv("LLM_MODERATION_MODEL_NAME", bedrock_model_name)
+
+    if not bedrock_model_name:
+        raise ValueError(
+            "LLM_AGRINET_MODEL_NAME or BEDROCK_MODEL_NAME environment variable is required"
+        )
+
+    bedrock_client = _get_default_bedrock_client()
+
+    AGRINET_MODEL = OpenAIChatModel(
+        bedrock_model_name,
+        provider=OpenAIProvider(openai_client=bedrock_client),
+    )
+    MODERATION_MODEL = OpenAIChatModel(
+        moderation_model_name,
+        provider=OpenAIProvider(openai_client=bedrock_client),
+    )
 else:
     raise ValueError(
-        f"Invalid LLM_PROVIDER: {LLM_PROVIDER}. Must be one of: 'vllm', 'openai', 'azure-openai'"
+        f"Invalid LLM_PROVIDER: {LLM_PROVIDER}. Must be one of: 'vllm', 'openai', 'azure-openai', 'bedrock'"
     )
 
 
