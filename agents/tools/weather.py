@@ -314,9 +314,9 @@ class WeatherRequest(BaseModel):
         
         return {
             "context": {
-                "domain": "weather-advisory:oan",
+                "domain": "weather-forecast:oan:kenya",
                 "action": "search",
-                "version": "1.1.0",
+                "version": "0.0.1",
                 "bap_id": os.getenv("BAP_ID"),
                 "bap_uri": os.getenv("BAP_URI"),
                 # "bpp_id": os.getenv("BPP_ID"),

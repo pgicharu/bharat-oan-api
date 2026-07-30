@@ -16,11 +16,8 @@ services:
       - .env
     restart: unless-stopped
     networks:
-      - svanetwork
       - beckn_network
 
 networks:
-  svanetwork:
-    external: true
   beckn_network:
     external: true
