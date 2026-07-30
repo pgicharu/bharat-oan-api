@@ -93,6 +93,17 @@ _QDRANT_SCHEME_DEFINITIONS: dict[str, dict[str, Any]] = {
             "national mission on edible oils",
         ],
     },
+    "makhana": {
+        "scheme_name": "Central Sector Scheme for Development of Makhana",
+        "scheme_aliases": [
+            "makhana",
+            "makana",
+            "foxnut",
+            "horticulture makhana",
+            "makhana scheme",
+            "development of makhana",
+        ],
+    },
 }
 
 QDRANT_SCHEME_CODES = frozenset(_QDRANT_SCHEME_DEFINITIONS.keys())
