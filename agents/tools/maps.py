@@ -27,8 +27,9 @@ _http_client = httpx.AsyncClient(base_url=PHOTON_BASE_URL, timeout=10.0)
 logger.info(f"Using Photon geocoder at {PHOTON_HOST}:{PHOTON_PORT}")
 
 # India bounding box [min_lon, min_lat, max_lon, max_lat]
-INDIA_BBOX = [68.0, 6.0, 98.0, 36.0]
-
+# INDIA_BBOX = [68.0, 6.0, 98.0, 36.0]
+KENYA_BBOX = [33.5, -5.0, 42.0, 5.5]
+INDIA_BBOX = KENYA_BBOX  # Use Kenya bounding box for testing; to be in sync with the original code
 
 class Location(BaseModel):
     """Location model for the maps tool."""
