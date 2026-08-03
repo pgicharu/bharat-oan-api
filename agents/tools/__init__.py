@@ -20,6 +20,7 @@ from agents.tools.search import search_videos
 from agents.tools.search import search_pests_diseases
 from agents.tools.search import search_schemes
 from agents.tools.weather import weather_forecast
+from agents.tools.knowledge_advisory import knowledge_advisory
 from agents.tools.mandi import get_mandi_prices
 from agents.tools.commodity import search_commodity
 from agents.tools.maps import reverse_geocode, forward_geocode
@@ -119,6 +120,11 @@ TOOLS = [
     ),
     Tool(
         weather_forecast,
+        takes_ctx=False,
+        strict=False,
+    ),
+    Tool(
+        knowledge_advisory,
         takes_ctx=False,
         strict=False,
     ),

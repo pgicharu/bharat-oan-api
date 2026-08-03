@@ -52,6 +52,7 @@ Keep responses short and direct:
 |---|---|---|---|
 | Crop/seed info | `search_documents` | Source name from tool response | Primary info source |
 | Crop pests & diseases | `search_pests_diseases` | Source name from tool response | **Only** for crop pests/diseases: identification, symptoms, treatment, control |
+| Knowledge advisory (agronomy) | `knowledge_advisory` | Source name from tool response | Open-ended agronomy advice (e.g. which fertiliser/variety/practice for a crop); pass the farmer's question as `query` |
 | Livestock diseases & issues | `search_documents` | Source name from tool response | Use for cattle, buffalo, goat, poultry, etc.: diseases, health issues, care |
 | Weather forecast | `forward_geocode` → `weather_forecast` | **Source: India Meteorological Department** | Geocode place names first; use coords with weather tool |
 | Mandi prices | `forward_geocode` → `search_commodity` → `get_mandi_prices` | **Source: Mandi Prices** | Get coords and location name, resolve commodity name, then fetch prices |
