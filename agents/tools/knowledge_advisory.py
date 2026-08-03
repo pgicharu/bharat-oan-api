@@ -11,7 +11,7 @@ from app.config import DEFAULT_HTTP_TIMEOUT
 from app.utils import get_cache
 from pydantic import BaseModel, AnyHttpUrl, Field
 from typing import List, Optional, Dict, Any, Tuple
-from pydantic_ai import ModelRetry, UnexpectedModelBehavior
+from pydantic_ai import UnexpectedModelBehavior
 from dotenv import load_dotenv
 from langfuse import observe
 from helpers.langfuse_tracing import lf_update_current_observation
@@ -22,9 +22,30 @@ logger = get_logger(__name__)
 
 # Fixed advisory search parameters (see tool docstring).
 KA_DOMAIN = "knowledge-advisory:oan:kenya"
-KA_TOP_K = "5"
+KA_TOP_K = "10"
 KA_ADVISORY_DOMAIN = "agronomy"
 KA_LANGUAGE = "en"
+
+# Tag groups that carry search bookkeeping rather than advisory content, and so
+# are not rendered into the agent's tool result.
+TAG_CODES_NOT_ADVISORY = {"citation", "retrieval", "classification"}
+
+
+def _advisory_error(detail: str) -> str:
+    """Build an unambiguous tool-failure string for the agent.
+
+    The agent must never paper over an advisory failure with its own background
+    knowledge, so every failure path spells that out instead of returning a
+    short message the model can read as "nothing to add here".
+    """
+    return (
+        f"KNOWLEDGE_ADVISORY_ERROR: {detail} "
+        "No advisory content was returned by the service. "
+        "Tell the farmer plainly that the advisory service did not respond and that you "
+        "could not retrieve the information. Do NOT answer the question from your own "
+        "knowledge, do NOT add general tips or typical dosages, and do NOT cite any source. "
+        "Offer to help with another farming question instead."
+    )
 
 # -----------------------
 # Images
@@ -136,6 +157,24 @@ class Item(BaseModel):
                         return item.value
         return None
 
+    def _extra_tags(self) -> List[Tag]:
+        """Return tags carrying advisory content beyond the citation block.
+
+        The BPP is free to put dosages or other advisory detail in tags rather
+        than in long_desc, so anything unrecognised is passed through to the
+        agent instead of being silently dropped. Only search bookkeeping is
+        skipped: the citation is already rendered as the source line, and
+        retrieval scores / classification say nothing a farmer can act on.
+        """
+        extras = []
+        for tag in self.tags or []:
+            if (tag.descriptor.code or "").lower() in TAG_CODES_NOT_ADVISORY:
+                continue
+            if not any(item.value for item in tag.list):
+                continue
+            extras.append(tag)
+        return extras
+
     def __str__(self) -> str:
         lines = []
         lines.append(f"**Item:** {self.descriptor.name or self.id}")
@@ -143,6 +182,9 @@ class Item(BaseModel):
             lines.append(f"  {self.descriptor.short_desc}")
         if self.descriptor.long_desc:
             lines.append(f"  {self.descriptor.long_desc.strip()}")
+        for tag in self._extra_tags():
+            tag_str = str(tag).replace("\n", "\n  ")
+            lines.append(f"  {tag_str}")
         source = self._citation_source()
         if source:
             lines.append(f"  Source: {source}")
@@ -228,12 +270,12 @@ class KnowledgeAdvisoryResponse(BaseModel):
         return False
 
     def __str__(self) -> str:
-        lines = ["**Knowledge Advisory**"]
-        no_data_message = "No knowledge advisory found for the requested query."
-
         if len(self.responses) == 0 or not self._has_advisory_data():
-            lines.append(no_data_message)
-            return "\n".join(lines)
+            return _advisory_error(
+                "The knowledge advisory service replied but the catalog contained no advisory items."
+            )
+
+        lines = ["**Knowledge Advisory**"]
 
         lines.append("Responses:")
         for rsp in self.responses:
@@ -425,7 +467,7 @@ async def knowledge_advisory(query: str) -> str:
         bap_endpoint = os.getenv("BAP_ENDPOINT")
         if not bap_endpoint:
             logger.error("BAP_ENDPOINT is not set")
-            return "Knowledge advisory service configuration error. BAP_ENDPOINT is not set."
+            return _advisory_error("The advisory service is not configured (BAP_ENDPOINT is not set).")
         search_url = bap_endpoint.rstrip("/") + "/search"
         logger.info(f"Knowledge advisory API search URL: {search_url}")
         response = httpx.post(
@@ -440,12 +482,14 @@ async def knowledge_advisory(query: str) -> str:
                 search_url,
                 response.text[:500] if response.text else "(empty)",
             )
-            return "Knowledge advisory service unavailable. Please try again later."
+            return _advisory_error(
+                f"The advisory service returned HTTP {response.status_code}."
+            )
         logger.info("Knowledge advisory API response OK")
         data = response.json()
         normalized_data, nack_msg, ack_pending = _normalize_advisory_result(data)
         if nack_msg:
-            return nack_msg
+            return _advisory_error(f"The advisory network rejected the request: {nack_msg}")
 
         if ack_pending:
             transaction_id = payload.get("context", {}).get("transaction_id")
@@ -458,26 +502,52 @@ async def knowledge_advisory(query: str) -> str:
             if normalized_data is None:
                 normalized_data = await _poll_advisory_async_result(search_url, payload)
             if normalized_data is None:
-                return (
-                    "Knowledge advisory request accepted by the network. "
-                    "Details will arrive asynchronously via on_search."
+                logger.error(
+                    "Knowledge advisory on_search never arrived for transaction_id %s "
+                    "(network ACKed the search but no callback was received)",
+                    transaction_id,
+                )
+                return _advisory_error(
+                    "The advisory network acknowledged the search but no on_search response "
+                    "was received before the timeout."
                 )
 
         if normalized_data is None:
-            return "Knowledge advisory service returned an unexpected response format."
+            return _advisory_error("The advisory service returned an unexpected response format.")
 
-        advisory_response = KnowledgeAdvisoryResponse.model_validate(normalized_data)
-        return str(advisory_response)
+        try:
+            advisory_response = KnowledgeAdvisoryResponse.model_validate(normalized_data)
+        except Exception as e:
+            logger.error(f"Knowledge advisory response failed validation: {e}")
+            return _advisory_error("The advisory response could not be parsed.")
+
+        rendered = str(advisory_response)
+        item_count = sum(
+            len(rsp.message.catalog.all_items()) for rsp in advisory_response.responses
+        )
+        logger.info(
+            "Knowledge advisory rendered %s item(s) into %s characters for the agent",
+            item_count,
+            len(rendered),
+        )
+        lf_update_current_observation(
+            metadata={
+                "tool": "knowledge_advisory.search",
+                "item_count": item_count,
+                "rendered_chars": len(rendered),
+            }
+        )
+        return rendered
 
     except httpx.TimeoutException:
         logger.error("Knowledge advisory API request timed out")
-        return "Knowledge advisory request timed out. Please try again."
+        return _advisory_error("The request to the advisory service timed out.")
     except httpx.RequestError as e:
         logger.error(f"Knowledge advisory API request failed: {e}")
-        return f"Knowledge advisory request failed: {str(e)}"
+        return _advisory_error(f"The request to the advisory service failed: {str(e)}")
     except UnexpectedModelBehavior:
         logger.warning("Knowledge advisory request exceeded retry limit")
-        return "Knowledge advisory is temporarily unavailable. Please try again later."
+        return _advisory_error("The advisory service is temporarily unavailable.")
     except Exception as e:
         logger.error(f"Error getting knowledge advisory: {e}")
-        raise ModelRetry(f"Unexpected error in knowledge advisory. {str(e)}")
+        return _advisory_error(f"An unexpected error occurred: {str(e)}")
