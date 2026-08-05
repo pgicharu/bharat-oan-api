@@ -1,5 +1,5 @@
 """
-Weather tool for fetching weather forecast data using the IMD API.
+Weather tool for fetching weather forecast data via the Beckn BAP search API.
 """
 import asyncio
 import os

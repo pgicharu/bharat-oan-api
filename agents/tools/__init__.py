@@ -15,9 +15,9 @@ from agents.tools.pmfby_grievance import (
 from agents.tools.shc_scheme_status import check_shc_status
 from agents.tools.pmkisan_grievance import submit_pmkisan_grievance, pmkisan_grievance_status
 from agents.tools.terms import search_terms
-from agents.tools.search import search_documents
-from agents.tools.search import search_videos
-from agents.tools.search import search_pests_diseases
+# Marqo-backed advisory search (search_documents / search_videos /
+# search_pests_diseases) is intentionally not registered: all agricultural
+# advisory now routes through `knowledge_advisory`.
 from agents.tools.search import search_schemes
 from agents.tools.weather import weather_forecast
 from agents.tools.knowledge_advisory import knowledge_advisory
@@ -99,22 +99,7 @@ TOOLS = [
         strict=False,
     ),
     Tool(
-        search_documents,
-        takes_ctx=False,
-        strict=False,
-    ),
-    Tool(
         search_schemes,
-        takes_ctx=False,
-        strict=False,
-    ),
-    Tool(
-        search_videos,
-        takes_ctx=False,
-        strict=False,
-    ),
-    Tool(
-        search_pests_diseases,
         takes_ctx=False,
         strict=False,
     ),

@@ -447,8 +447,11 @@ async def _poll_advisory_callback_cache(transaction_id: str | None) -> Optional[
 async def knowledge_advisory(query: str) -> str:
     """Get an agronomy knowledge advisory for a farmer's question.
 
-    Use this for open-ended crop/agricultural advisory questions such as which
-    fertiliser, variety, or practice to use.
+    This is the ONLY source of agricultural advisory content. Use it for every
+    crop, seed, soil, pest, disease, livestock, irrigation, storage, or farming
+    practice question — including symptom identification, prevention, and
+    treatment (e.g. "early signs of fall armyworm infestation"), which
+    fertiliser or variety to use, and general agronomy know-how.
 
     Args:
         query (str): The farmer's question, e.g. "What fertiliser should I use for maize?"
