@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, field_validator
 from helpers.utils import get_logger
 from langfuse import observe
+from agents.tools.kenya_counties import COUNTY_COORDS, find_county
 
 logger = get_logger(__name__)
 
@@ -96,6 +97,19 @@ async def forward_geocode(place_name: str) -> str:
     Returns:
         str: The location details or an error message if not found in India.
     """
+    # Resolve Kenyan counties from the offline gazetteer first. Photon is remote
+    # and may be slow or unreachable; for county-level names the table is both
+    # authoritative and free, and avoids a 10s timeout on every such lookup.
+    county = find_county(place_name)
+    if county:
+        latitude, longitude = COUNTY_COORDS[county]
+        logger.info(f"Resolved '{place_name}' to county {county} from local gazetteer")
+        return Location(
+            place_name=f"{county}, Kenya",
+            latitude=latitude,
+            longitude=longitude,
+        )._location_string()
+
     try:
         response = await _http_client.get("/api", params={
             "q": place_name,

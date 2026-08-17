@@ -21,6 +21,11 @@ from agents.tools.terms import search_terms
 from agents.tools.search import search_schemes
 from agents.tools.weather import weather_forecast
 from agents.tools.knowledge_advisory import knowledge_advisory
+# farmer_registry_lookup is intentionally not registered here — the model
+# reliably skipped calling it even with explicit prompt instructions.
+# agents.tools.farmer_registry.fetch_farmer_profile_context is called
+# deterministically from app.services.chat before the agent runs instead;
+# see that module's docstring.
 from agents.tools.mandi import get_mandi_prices
 from agents.tools.commodity import search_commodity
 from agents.tools.maps import reverse_geocode, forward_geocode

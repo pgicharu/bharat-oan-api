@@ -20,4 +20,8 @@ class TTSResponse(BaseResponse):
 
 class ErrorResponse(BaseResponse):
     error_code: Optional[str] = Field(None, description="Error code")
-    details: Optional[Any] = Field(None, description="Additional error details") 
+    details: Optional[Any] = Field(None, description="Additional error details")
+
+class FarmerRegistryLoginResponse(BaseModel):
+    farmer_id: str = Field(..., description="Stable farmer-registry identifier")
+    farmer_token: str = Field(..., description="Opaque farmer-registry identifier; store client-side and resend as ChatRequest.farmer_token")

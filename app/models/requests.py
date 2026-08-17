@@ -12,6 +12,7 @@ class ChatRequest(BaseModel):
     user_id: str = Field('anonymous', description="User identifier")
     latitude: Optional[str] = Field(None, description="Request-time latitude")
     longitude: Optional[str] = Field(None, description="Request-time longitude")
+    farmer_token: Optional[str] = Field(None, description="Opaque farmer-registry identifier for advisory context enrichment")
 
 class TelemetryFeedbackRequest(BaseModel):
     qid: str = Field(..., description="Question or message ID for telemetry correlation")
@@ -65,3 +66,7 @@ class TTSRequest(BaseModel):
 class FileRequest(BaseModel):
     file_uuid: str = Field(..., description="File UUID")
     session_id: Optional[str] = Field(None, description=SESSION_ID_DESCRIPTION)
+
+class FarmerRegistryLoginRequest(BaseModel):
+    phone: str = Field(..., description="Phone number registered with the farmer registry")
+    password: str = Field(..., description="Farmer registry account password")

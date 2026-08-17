@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from copy import deepcopy
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional, Tuple
 from urllib.parse import quote
 
 from fastapi import BackgroundTasks
@@ -17,7 +17,9 @@ from pydantic_ai.usage import RequestUsage
 from agents.agrinet import agrinet_agent
 from agents.deps import FarmerContext
 from agents.tools.maps import forward_geocode
+from agents.tools.kenya_counties import county_coordinates, find_county
 from agents.tools.weather import weather_forecast
+from agents.tools.farmer_registry import fetch_farmer_profile_context
 from agents.models import (
     LANGFUSE_MODERATION_MODEL_NAME,
     LLM_PROVIDER,
@@ -297,7 +299,18 @@ def _looks_like_weather_query(query: str) -> bool:
     text = (query or "").strip().lower()
     if not text:
         return False
-    keywords = ("weather", "forecast", "temperature", "rain", "humidity", "wind")
+    keywords = (
+        "weather",
+        "forecast",
+        "temperature",
+        "rain",
+        "humidity",
+        "wind",
+        # Swahili. Deliberately limited to the unambiguous weather phrase: bare
+        # "mvua"/"joto" are everyday farming vocabulary and would divert ordinary
+        # agronomy questions into the weather path.
+        "hali ya hewa",
+    )
     return any(keyword in text for keyword in keywords)
 
 
@@ -324,14 +337,35 @@ def _extract_lat_lon_from_text(text: str) -> tuple[float, float] | None:
     return None
 
 
+# Possessive/generic references to "wherever the farmer already is" — never
+# real place names. A bare regex capture of "weather in my county" would
+# otherwise hand "my county" to county_coordinates/forward_geocode as if it
+# were a place, which reliably fails (no county is literally named "my
+# county") instead of falling through to the farmer's actual registered
+# county below.
+_GENERIC_LOCATION_PHRASES = {
+    "my county", "my district", "my area", "my location", "my place",
+    "my region", "my farm", "our county", "our district", "our area",
+    "here", "near me", "this area", "the area", "this county", "this district",
+}
+
+
+def _is_generic_location_phrase(text: str) -> bool:
+    return (text or "").strip().lower() in _GENERIC_LOCATION_PHRASES
+
+
 def _extract_location_from_weather_query(query: str) -> str | None:
     text = (query or "").strip()
     if not text:
         return None
 
+    county = find_county(text)
+    if county:
+        return county
+
     patterns = [
-        r"(?:weather|forecast)\s+(?:at|in|for)\s+([A-Za-z\s,.-]{2,})",
-        r"(?:at|in|for)\s+([A-Za-z\s,.-]{2,})\s+(?:weather|forecast)",
+        r"(?:weather|forecast)\s+(?:\bat\b|\bin\b|\bfor\b)\s+([A-Za-z\s,.-]{2,})",
+        r"(?:\bat\b|\bin\b|\bfor\b)\s+([A-Za-z\s,.-]{2,})\s+(?:weather|forecast)",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -344,55 +378,103 @@ def _extract_location_from_weather_query(query: str) -> str | None:
             location,
             flags=re.IGNORECASE,
         ).strip(" .?,-")
-        return location or None
+        if not location or _is_generic_location_phrase(location):
+            return None
+        return location
 
     return None
 
 
-def _fallback_coordinates_for_location(location: str | None) -> tuple[float, float] | None:
-    if not location:
-        return None
+async def _resolve_weather_coordinates(
+    raw_query: str,
+    farmer_coordinates: Optional[Tuple[float, float]] = None,
+) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
+    """Deterministically resolve (lat, lon) for a weather-shaped query.
 
-    normalized = re.sub(r"\s+", " ", location.strip().lower())
-    city_coords: dict[str, tuple[float, float]] = {
-        "delhi": (28.6139, 77.2090),
-        "new delhi": (28.6139, 77.2090),
-        "mumbai": (19.0760, 72.8777),
-        "pune": (18.5204, 73.8567),
-        "bengaluru": (12.9716, 77.5946),
-        "bangalore": (12.9716, 77.5946),
-        "hyderabad": (17.3850, 78.4867),
-        "chennai": (13.0827, 80.2707),
-        "kolkata": (22.5726, 88.3639),
-    }
-    return city_coords.get(normalized)
+    Resolution order: explicit lat/lon already in the query text -> a named
+    place in the query (offline Kenya county table, else a live
+    `forward_geocode` call) -> the farmer's registered county, already
+    resolved via that same offline table (see
+    `agents.tools.farmer_registry.fetch_farmer_profile_context`). This runs
+    entirely in code rather than relying on the model to notice a phrase like
+    "my county" isn't a real place and chain lookup -> geocode -> weather
+    itself — see that module's docstring for why.
 
-
-async def _try_weather_tool_response(raw_query: str) -> str | None:
-    if not _looks_like_weather_query(raw_query):
-        return None
-
+    Returns:
+        `(coordinates, geocode_error)`. `geocode_error` is set only when an
+        explicit place was named but a live `forward_geocode` lookup for it
+        failed — the caller can surface that failure directly instead of
+        silently falling through to a full model call that might hallucinate
+        a location. Both are None when the query has no place, no browser
+        coordinates, and no farmer profile to fall back on.
+    """
     coords = _extract_lat_lon_from_text(raw_query)
-    geocode_result: str | None = None
-    location: str | None = None
-    if coords is None:
-        location = _extract_location_from_weather_query(raw_query)
-        if location:
+    if coords:
+        return coords, None
+
+    geocode_error: Optional[str] = None
+    location = _extract_location_from_weather_query(raw_query)
+    if location:
+        # The county table is authoritative and offline, so prefer it over a
+        # geocoder round trip that may be slow, unreachable, or ambiguous.
+        coords = county_coordinates(location)
+        if coords is None:
             geocode_result = await forward_geocode(location)
             coords = _extract_lat_lon_from_text(geocode_result)
             if coords is None:
-                coords = _fallback_coordinates_for_location(location)
+                geocode_error = geocode_result
 
-    if coords is None and geocode_result:
-        # Keep weather responses tool-driven: return location/tool error instead of model hallucination.
-        return geocode_result
+    if coords is None and geocode_error is None:
+        coords = farmer_coordinates
+
+    return coords, geocode_error
+
+
+async def _try_weather_tool_response(
+    raw_query: str,
+    farmer_coordinates: Optional[Tuple[float, float]] = None,
+) -> str | None:
+    if not _looks_like_weather_query(raw_query):
+        return None
+
+    coords, geocode_error = await _resolve_weather_coordinates(raw_query, farmer_coordinates)
 
     if coords is None:
-        return None
+        # Keep weather responses tool-driven: surface a location/tool error
+        # instead of falling through to a full model call that might
+        # hallucinate a location. None (no error either) means we simply had
+        # nothing to go on — let the caller ask the farmer normally.
+        return geocode_error
 
     lat, lon = coords
     logger.info("Weather query routed through tool path with coordinates: %s, %s", lat, lon)
     return await weather_forecast(latitude=lat, longitude=lon)
+
+
+async def _weather_location_note(
+    query: str, farmer_coordinates: Optional[Tuple[float, float]]
+) -> Optional[str]:
+    """Build a short, high-salience note handing the agent already-resolved
+    coordinates for a weather-shaped query, so it only has to copy two
+    numbers into `weather_forecast` instead of noticing a possessive phrase
+    like "my county" isn't a place name and chaining farmer-profile lookup ->
+    geocode -> weather itself — see `_resolve_weather_coordinates` for why
+    that chain wasn't reliable. Returns None for non-weather queries or when
+    nothing resolves (explicit place, browser coordinates, and farmer
+    profile all absent) — the agent falls back to asking the farmer, as
+    before.
+    """
+    if not _looks_like_weather_query(query):
+        return None
+    coords, _geocode_error = await _resolve_weather_coordinates(query, farmer_coordinates)
+    if coords is None:
+        return None
+    lat, lon = coords
+    return (
+        f"**Resolved location for this weather query:** latitude={lat}, longitude={lon}. "
+        "Call weather_forecast with these exact numbers for this turn — do not call "
+        "forward_geocode again."
+    )
 
 
 async def _record_chat_turn(
@@ -431,6 +513,7 @@ async def stream_chat_messages(
     channel: str = "BharatVistaar",
     qid: str = "",
     current_user: Optional[dict] = None,
+    farmer_token: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Async generator for streaming chat messages."""
     telemetry_user = current_user or {"channel": channel}
@@ -501,6 +584,18 @@ async def stream_chat_messages(
                 query=query,
                 lang_code=target_lang,
                 session_id=session_id,
+                farmer_token=farmer_token,
+            )
+
+            # Fetch the farmer profile deterministically, concurrently with
+            # moderation (independent of it) — this used to be an
+            # agent-callable tool the model decided whether to invoke, but it
+            # reliably skipped calling it even with explicit instructions to.
+            # See agents.tools.farmer_registry's module docstring.
+            farmer_profile_task = (
+                asyncio.create_task(fetch_farmer_profile_context(farmer_token))
+                if farmer_token
+                else None
             )
 
             message_pairs = "\n\n".join(format_message_pairs(history, 3))
@@ -514,6 +609,15 @@ async def stream_chat_messages(
             moderation_data = await _run_moderation(user_message, session_id)
             logger.info("Moderation data: %s", moderation_data)
             deps.update_moderation_str(str(moderation_data))
+
+            if farmer_profile_task is not None:
+                farmer_profile_text, farmer_coordinates = await farmer_profile_task
+                deps.update_farmer_profile(farmer_profile_text, farmer_coordinates)
+
+            weather_note = await _weather_location_note(query, deps.farmer_coordinates)
+            if weather_note:
+                last_response = f"{last_response}{weather_note}\n\n"
+
             user_message = f"{last_response}{deps.get_user_message()}"
 
             trimmed_history = trim_history(history, max_tokens=64_000)
@@ -797,7 +901,7 @@ async def _run_agrinet_once_streaming(
     )
 
     if _is_bedrock_mode():
-        weather_output = await _try_weather_tool_response(deps.query)
+        weather_output = await _try_weather_tool_response(deps.query, deps.farmer_coordinates)
         if weather_output:
             usage = RequestUsage(input_tokens=0, output_tokens=0)
             if chunk_queue is not None:
@@ -958,7 +1062,7 @@ async def _run_agrinet_once(
     )
 
     if _is_bedrock_mode():
-        weather_output = await _try_weather_tool_response(deps.query)
+        weather_output = await _try_weather_tool_response(deps.query, deps.farmer_coordinates)
         if weather_output:
             usage = RequestUsage(input_tokens=0, output_tokens=0)
             synthetic_messages = [

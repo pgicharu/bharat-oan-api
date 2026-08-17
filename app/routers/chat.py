@@ -46,6 +46,7 @@ async def chat_endpoint(
             channel=channel,
             qid=qid,
             current_user=current_user,
+            farmer_token=request.farmer_token,
         ),
         media_type="text/event-stream",
         headers={
