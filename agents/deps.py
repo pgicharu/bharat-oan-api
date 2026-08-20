@@ -14,12 +14,12 @@ class FarmerContext(BaseModel):
 
 
     Example:
-        **User:** "What is the weather in Mumbai?"
-        **Selected Language:** Hindi
+        **User:** "What is the weather in Nakuru?"
+        **Selected Language:** English
         **Moderation Compliance:** "Valid Agricultural (This is a valid agricultural question.)"
     """
     query: str = Field(description="The user's question.")
-    lang_code: str = Field(description="The language code of the user's question.", default='hi')
+    lang_code: str = Field(description="The language code of the user's question.", default='en')
     session_id: str = Field(description="The session ID for the conversation.")
     moderation_str: Optional[str] = Field(default=None, description="The moderation result of the user's question.")
     farmer_token: Optional[str] = Field(

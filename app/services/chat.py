@@ -239,9 +239,8 @@ async def _run_bedrock_moderation(user_message: str) -> QueryModerationResult:
 
 
 def _build_agrinet_system_prompt(deps: FarmerContext) -> str:
-    lang_code = deps.lang_code if deps.lang_code else "en"
     return get_prompt(
-        f"agrinet_{lang_code}",
+        "agrinet_en",
         context={
             "today_date": get_today_date_str(),
             "crop_season": get_crop_season(),

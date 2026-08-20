@@ -28,6 +28,4 @@ agrinet_agent = Agent(
 @agrinet_agent.system_prompt(dynamic=True)
 def get_system_prompt(ctx: RunContext[FarmerContext]):
     """Get the system prompt for the agrinet agent."""
-    deps = ctx.deps
-    lang_code = deps.lang_code if deps.lang_code else 'en'
-    return get_prompt(f'agrinet_{lang_code}', context={'today_date': get_today_date_str(), 'crop_season': get_crop_season()})
+    return get_prompt('agrinet_en', context={'today_date': get_today_date_str(), 'crop_season': get_crop_season()})

@@ -16,7 +16,7 @@ def remove_urls(text):
     return re.sub(r'https?://\S+', '', text)
 
 
-def text_to_speech_bhashini(text, source_lang='hi', gender='female', sampling_rate=8000):
+def text_to_speech_bhashini(text, source_lang='en', gender='female', sampling_rate=8000):
     url = 'https://dhruva-api.bhashini.gov.in/services/inference/pipeline'
     service_id = "tts"
     headers = {
