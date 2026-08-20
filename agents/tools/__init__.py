@@ -33,6 +33,7 @@ from agents.tools.agrovets import search_agrovets
 from agents.tools.food_prices import search_food_prices
 from agents.tools.soil_data import get_soil_data
 from agents.tools.tractor_operators import search_tractor_operators
+from agents.tools.pcpb import search_pesticide_products
 from agents.tools.smam_scheme_status import check_smam_scheme_status
 from agents.tools.gfr import gfr_get_recommendations, gfr_get_crop_registries
 from agents.tools.sathi_seed import (
@@ -189,6 +190,11 @@ TOOLS = [
     ),
     Tool(
         search_tractor_operators,
+        takes_ctx=False,
+        strict=False,
+    ),
+    Tool(
+        search_pesticide_products,
         takes_ctx=False,
         strict=False,
     ),
