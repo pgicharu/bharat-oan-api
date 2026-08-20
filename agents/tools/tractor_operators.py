@@ -24,7 +24,13 @@ are rendered as returned.
 
 **No geo filtering.** The source data carries no coordinates — unlike
 `agrovets`/`food_prices`, there is no latitude/longitude/radius_km here.
-Location narrowing is by the raw `region`/`state` free-text fields only.
+Location narrowing is by the raw `region`/`state` free-text fields only —
+and those two mix granularities inconsistently per record (`region` is
+often a ward/town, `state` is the county, and `region` never appears
+without `state` also being set). A bare place name passed only as
+`region` is therefore searched against `state` first, falling back to
+`region` itself only if that comes back empty — see
+`search_tractor_operators`'s docstring.
 """
 import asyncio
 import os
@@ -433,6 +439,60 @@ async def _poll_tractor_operators_callback_cache(transaction_id: str | None) -> 
     return None
 
 
+async def _execute_tractor_operators_search(payload: Dict[str, Any]) -> Tuple[Optional[TractorOperatorsResponse], Optional[str]]:
+    """Run one full search + async-poll cycle. Returns (parsed_response, error_string) —
+    exactly one is set. A parsed response with zero providers is a legitimate
+    empty result, not an error."""
+    bap_endpoint = os.getenv("BAP_ENDPOINT")
+    if not bap_endpoint:
+        logger.error("BAP_ENDPOINT is not set")
+        return None, _tractor_operators_error("The tractor operators service is not configured (BAP_ENDPOINT is not set).")
+    search_url = bap_endpoint.rstrip("/") + "/search"
+    logger.info("Tractor operators API search URL: %s", search_url)
+    response = httpx.post(search_url, json=payload, timeout=DEFAULT_HTTP_TIMEOUT)
+    if not response.is_success:
+        logger.error(
+            "Tractor operators API returned status %s for URL %s — response: %s",
+            response.status_code,
+            search_url,
+            response.text[:500] if response.text else "(empty)",
+        )
+        return None, _tractor_operators_error(f"The tractor operators service returned HTTP {response.status_code}.")
+    logger.info("Tractor operators API response OK")
+    data = response.json()
+    normalized_data, nack_msg, ack_pending = _normalize_tractor_operators_result(data)
+    if nack_msg:
+        return None, _tractor_operators_error(f"The tractor operators network rejected the request: {nack_msg}")
+
+    if ack_pending:
+        transaction_id = payload.get("context", {}).get("transaction_id")
+
+        normalized_data = await _poll_tractor_operators_callback_cache(transaction_id)
+        if normalized_data is None:
+            normalized_data = await _poll_tractor_operators_async_result(search_url, payload)
+        if normalized_data is None:
+            logger.error(
+                "Tractor operators on_search never arrived for transaction_id %s "
+                "(network ACKed the search but no callback was received)",
+                transaction_id,
+            )
+            return None, _tractor_operators_error(
+                "The tractor operators network acknowledged the search but no "
+                "on_search response was received before the timeout."
+            )
+
+    if normalized_data is None:
+        return None, _tractor_operators_error("The tractor operators service returned an unexpected response format.")
+
+    try:
+        parsed = TractorOperatorsResponse.model_validate(normalized_data)
+    except Exception as e:
+        logger.error("Tractor operators response failed validation: %s", e)
+        return None, _tractor_operators_error("The tractor operators response could not be parsed.")
+
+    return parsed, None
+
+
 @observe(name="tool:search_tractor_operators", as_type="tool")
 async def search_tractor_operators(
     implement: Optional[str] = None,
@@ -462,10 +522,15 @@ async def search_tractor_operators(
             "John Deere", "Massey Ferguson". Free text — this field has many
             spelling variants in the source data, pass what the farmer said.
         language: Language the operator speaks, e.g. "English", "Kiswahili".
-        region: Region/area name, e.g. "Nandi". Free text, matches the raw
-            source field.
-        state: State/county-level name. Free text, matches the raw source
-            field — may duplicate `region` for some records.
+        region: A place name the farmer mentioned, e.g. "Nyamira", "Bokeira
+            Ward". If `state` isn't also given, this value is searched
+            against `state` first (Kenyan county names live there for the
+            great majority of records) and only re-tried against `region`
+            itself if that comes back empty — pass whatever place name the
+            farmer said without worrying about which field it's actually
+            stored in.
+        state: County-level name, e.g. "Nyamira", "Kisii". Prefer this over
+            `region` when the farmer clearly named a county.
         experience_level: "JUNIOR" or "SENIOR".
         gender: Operator's gender, if the farmer specifically asks for one.
         min_years_experience: Minimum years of experience required.
@@ -501,63 +566,44 @@ async def search_tractor_operators(
                 "state, experience level, gender, or a minimum experience/rating "
                 "— do not present this as a full operator listing to the farmer."
             )
-        payload = request.get_payload()
+
+        # region/state mix granularities inconsistently in the source data,
+        # but state is where county names actually live for the near-
+        # totality of records (region never appears without state also
+        # being set — see the module docstring). A bare place name passed
+        # only as `region` is therefore tried as `state` first, falling
+        # back to `region` itself only if that's empty.
+        location_fallback = bool(region) and not state
+        if location_fallback:
+            payload = TractorOperatorsSearchRequest(
+                implement=implement, familiar_tractor=familiar_tractor, language=language,
+                region=None, state=region, experience_level=experience_level, gender=gender,
+                min_years_experience=min_years_experience, min_star_rating=min_star_rating,
+            ).get_payload()
+        else:
+            payload = request.get_payload()
+
         lf_update_current_observation(
             metadata={
                 "tool": "tractor_operators.search",
                 "transaction_id": payload.get("context", {}).get("transaction_id"),
+                "location_fallback": location_fallback,
             }
         )
 
-        bap_endpoint = os.getenv("BAP_ENDPOINT")
-        if not bap_endpoint:
-            logger.error("BAP_ENDPOINT is not set")
-            return _tractor_operators_error("The tractor operators service is not configured (BAP_ENDPOINT is not set).")
-        search_url = bap_endpoint.rstrip("/") + "/search"
-        logger.info("Tractor operators API search URL: %s", search_url)
-        response = httpx.post(search_url, json=payload, timeout=DEFAULT_HTTP_TIMEOUT)
-        if not response.is_success:
-            logger.error(
-                "Tractor operators API returned status %s for URL %s — response: %s",
-                response.status_code,
-                search_url,
-                response.text[:500] if response.text else "(empty)",
-            )
-            return _tractor_operators_error(f"The tractor operators service returned HTTP {response.status_code}.")
-        logger.info("Tractor operators API response OK")
-        data = response.json()
-        normalized_data, nack_msg, ack_pending = _normalize_tractor_operators_result(data)
-        if nack_msg:
-            return _tractor_operators_error(f"The tractor operators network rejected the request: {nack_msg}")
+        tractor_operators_response, error = await _execute_tractor_operators_search(payload)
+        if error:
+            return error
+        provider_count = len(tractor_operators_response._all_providers())
 
-        if ack_pending:
-            transaction_id = payload.get("context", {}).get("transaction_id")
-
-            normalized_data = await _poll_tractor_operators_callback_cache(transaction_id)
-            if normalized_data is None:
-                normalized_data = await _poll_tractor_operators_async_result(search_url, payload)
-            if normalized_data is None:
-                logger.error(
-                    "Tractor operators on_search never arrived for transaction_id %s "
-                    "(network ACKed the search but no callback was received)",
-                    transaction_id,
-                )
-                return _tractor_operators_error(
-                    "The tractor operators network acknowledged the search but no "
-                    "on_search response was received before the timeout."
-                )
-
-        if normalized_data is None:
-            return _tractor_operators_error("The tractor operators service returned an unexpected response format.")
-
-        try:
-            tractor_operators_response = TractorOperatorsResponse.model_validate(normalized_data)
-        except Exception as e:
-            logger.error("Tractor operators response failed validation: %s", e)
-            return _tractor_operators_error("The tractor operators response could not be parsed.")
+        if location_fallback and provider_count == 0:
+            logger.info("Tractor operators state-first search for %r found nothing, retrying against region", region)
+            tractor_operators_response, error = await _execute_tractor_operators_search(request.get_payload())
+            if error:
+                return error
+            provider_count = len(tractor_operators_response._all_providers())
 
         rendered = tractor_operators_response.format_output()
-        provider_count = len(tractor_operators_response._all_providers())
         logger.info("Tractor operators search rendered %s provider(s) into %s characters", provider_count, len(rendered))
         lf_update_current_observation(
             metadata={
