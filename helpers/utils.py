@@ -19,27 +19,30 @@ load_dotenv()
 
 def get_today_date_str() -> str:
     """Get today's date as a string in the format Monday, 23rd May 2025."""
-    ist = pytz.timezone('Asia/Kolkata')
-    today = datetime.now(ist)
+    eat = pytz.timezone('Africa/Nairobi')
+    today = datetime.now(eat)
     return today.strftime('%A, %d %B %Y')
 
 
 def get_crop_season(dt: datetime = None) -> str:
-    """Classify a date into an Indian agricultural season.
+    """Classify a date into a Kenyan agricultural season (bimodal rainfall calendar).
 
-    - Kharif (monsoon): June–September (sowing Jun-Jul, harvest Sep-Oct)
-    - Rabi (winter): October–February (sowing Oct-Nov, harvest Mar-Apr)
-    - Zaid (summer): March–May (short filler season between Rabi and Kharif)
+    - Long rains (main planting season): March–May
+    - Long rains harvest / dry season: June–September
+    - Short rains (second planting season): October–December
+    - Short rains harvest / dry season: January–February
     """
     if dt is None:
-        ist = pytz.timezone('Asia/Kolkata')
-        dt = datetime.now(ist)
+        eat = pytz.timezone('Africa/Nairobi')
+        dt = datetime.now(eat)
     month = dt.month
+    if 3 <= month <= 5:
+        return "Long Rains (Planting)"
     if 6 <= month <= 9:
-        return "Kharif (Monsoon)"
-    if month >= 10 or month <= 2:
-        return "Rabi (Winter)"
-    return "Zaid (Summer)"
+        return "Long Rains Harvest (Dry Season)"
+    if 10 <= month <= 12:
+        return "Short Rains (Planting)"
+    return "Short Rains Harvest (Dry Season)"
 
 
 def get_logger(name):

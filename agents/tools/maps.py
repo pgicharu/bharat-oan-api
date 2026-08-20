@@ -27,10 +27,8 @@ _http_client = httpx.AsyncClient(base_url=PHOTON_BASE_URL, timeout=10.0)
 
 logger.info(f"Using Photon geocoder at {PHOTON_HOST}:{PHOTON_PORT}")
 
-# India bounding box [min_lon, min_lat, max_lon, max_lat]
-# INDIA_BBOX = [68.0, 6.0, 98.0, 36.0]
+# Kenya bounding box [min_lon, min_lat, max_lon, max_lat]
 KENYA_BBOX = [33.5, -5.0, 42.0, 5.5]
-INDIA_BBOX = KENYA_BBOX  # Use Kenya bounding box for testing; to be in sync with the original code
 
 class Location(BaseModel):
     """Location model for the maps tool."""
@@ -89,13 +87,13 @@ def _feature_to_location(feature: dict, fallback_name: str = None) -> Location:
 
 @observe(name="tool:forward_geocode", as_type="tool")
 async def forward_geocode(place_name: str) -> str:
-    """Forward Geocoding to get latitude and longitude from a place name in India.
+    """Forward Geocoding to get latitude and longitude from a place name in Kenya.
 
     Args:
-        place_name (str): The place name to geocode, in English. For best results, include additional context like district or state (e.g. "Pune, Maharashtra" or "Latur, Maharashtra").
+        place_name (str): The place name to geocode, in English. For best results, include additional context like county (e.g. "Nakuru, Kenya" or "Kisumu, Kenya").
 
     Returns:
-        str: The location details or an error message if not found in India.
+        str: The location details or an error message if not found in Kenya.
     """
     # Resolve Kenyan counties from the offline gazetteer first. Photon is remote
     # and may be slow or unreachable; for county-level names the table is both
@@ -115,22 +113,22 @@ async def forward_geocode(place_name: str) -> str:
             "q": place_name,
             "limit": 10,
             "lang": "en",
-            "bbox": f"{INDIA_BBOX[0]},{INDIA_BBOX[1]},{INDIA_BBOX[2]},{INDIA_BBOX[3]}",
+            "bbox": f"{KENYA_BBOX[0]},{KENYA_BBOX[1]},{KENYA_BBOX[2]},{KENYA_BBOX[3]}",
         })
         response.raise_for_status()
         features = response.json().get("features", [])
 
         if features:
-            # Prefer results within India bounding box
+            # Prefer results within Kenya bounding box
             for feature in features:
                 coords = feature.get("geometry", {}).get("coordinates", [])
                 if len(coords) >= 2:
                     lon, lat = coords[0], coords[1]
-                    if (INDIA_BBOX[1] <= lat <= INDIA_BBOX[3] and
-                            INDIA_BBOX[0] <= lon <= INDIA_BBOX[2]):
+                    if (KENYA_BBOX[1] <= lat <= KENYA_BBOX[3] and
+                            KENYA_BBOX[0] <= lon <= KENYA_BBOX[2]):
                         return _feature_to_location(feature, place_name)._location_string()
 
-            # Fallback to first result if none matched India bbox
+            # Fallback to first result if none matched Kenya bbox
             return _feature_to_location(features[0], place_name)._location_string()
         else:
             logger.info(f"No results found for place: {place_name}")
@@ -171,7 +169,7 @@ async def reverse_geocode(latitude: float, longitude: float) -> Optional[Locatio
             "lat": latitude,
             "lon": longitude,
             "lang": "en",
-            "bbox": f"{INDIA_BBOX[0]},{INDIA_BBOX[1]},{INDIA_BBOX[2]},{INDIA_BBOX[3]}",
+            "bbox": f"{KENYA_BBOX[0]},{KENYA_BBOX[1]},{KENYA_BBOX[2]},{KENYA_BBOX[3]}",
         })
         response.raise_for_status()
         features = response.json().get("features", [])

@@ -55,6 +55,8 @@ logger = get_logger(__name__)
 
 FARMER_REGISTRY_DOMAIN = "farmers-registry:oan:kenya"
 FARMER_REGISTRY_VERSION = "0.0.1"
+FARMER_REGISTRY_COUNTRY = "KEN"
+FARMER_REGISTRY_CITY = "std:051"
 
 NO_PROFILE_MESSAGE = (
     "No farmer profile is on file for this session. Proceed using only what "
@@ -253,8 +255,8 @@ class FarmerLookupRequest(BaseModel):
         return {
             "context": {
                 "domain": FARMER_REGISTRY_DOMAIN,
-                "country": "IND",
-                "city": "std:080",
+                "country": FARMER_REGISTRY_COUNTRY,
+                "city": FARMER_REGISTRY_CITY,
                 "action": "search",
                 "version": FARMER_REGISTRY_VERSION,
                 "bap_id": os.getenv("BAP_ID"),
